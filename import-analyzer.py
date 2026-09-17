@@ -493,6 +493,7 @@ for module_fpath in sorted(to_check_imported_modules):
 	if names2:
 		_all_set.update(names2)
 	_all_set.discard("*")
+	_all_set_current.discard("*")
 	if not _all_set:
 		continue
 
@@ -505,9 +506,9 @@ for module_fpath in sorted(to_check_imported_modules):
 				continue
 			print(f"{module_fpath}: unused symbol {symbol} in __all__")
 
-	if len(_all_set) == len(_all_set_current):
+	add_list = sorted(_all_set.difference(_all_set_current))
+	if not add_list:
 		continue
-	add_list = list(_all_set.difference(_all_set_current))
 
 	if has_all:
 		print(module_fpath)
