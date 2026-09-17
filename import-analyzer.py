@@ -15,7 +15,6 @@ import tomllib
 
 warnings.simplefilter("ignore")
 
-modifyAndOpenFiles = True
 editor = os.getenv("IDE", "xdg-open")
 modifiedFiles = set()
 
@@ -25,10 +24,9 @@ parser = argparse.ArgumentParser(
 	# allow_abbrev=False,
 )
 parser.add_argument(
-	"-o",
-	"--out-dir",
-	dest="out_dir",
-	default=".",
+	"--no-modify",
+	action="store_true",
+	help="do not modify files, only print",
 )
 parser.add_argument(
 	"scan_dir",
@@ -37,6 +35,8 @@ parser.add_argument(
 	nargs="?",
 )
 args = parser.parse_args()
+
+modifyAndOpenFiles = not args.no_modify
 
 scanDir = realpath(args.scan_dir)
 
