@@ -474,10 +474,9 @@ for module_fpath in sorted(to_check_imported_modules):
 		continue
 	_, _all = find__all__(code)
 	has_all = False
-	if _all is None:
-		_all_set = set()
-		_all_set_current = set()
-	else:
+	_all_set = set()
+	_all_set_current = set()
+	if _all is not None:
 		has_all = True
 		_all_set = set(_all)
 		_all_set_current = _all_set.copy()
@@ -526,9 +525,7 @@ for module_fpath in sorted(to_check_imported_modules):
 				len(line) for line in text.splitlines(keepends=True)[: first.end_lineno]
 			)
 		new_text = (
-			text[:insert_at]
-			+ f"__all__ = {formatList(add_list)}\n"
-			+ text[insert_at:]
+			text[:insert_at] + f"__all__ = {formatList(add_list)}\n" + text[insert_at:]
 		)
 		with open(full_path, "w", encoding="utf-8") as file:
 			file.write(new_text)
