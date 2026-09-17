@@ -472,7 +472,7 @@ for module_fpath in sorted(to_check_imported_modules):
 	except Exception as e:
 		print(f"failed to parse {module_fpath=}: {e}", file=sys.stderr)
 		continue
-	_, _all = find__all__(code)
+	_all_stm, _all = find__all__(code)
 	has_all = False
 	_all_set = set()
 	_all_set_current = set()
@@ -509,7 +509,27 @@ for module_fpath in sorted(to_check_imported_modules):
 	if not add_list:
 		continue
 
-	if has_all:
+	_lines = text.splitlines(keepends=True)
+	_line_offsets = []
+	_offset = 0
+	for _line in _lines:
+		_line_offsets.append(_offset)
+		_offset += len(_line)
+
+	if has_all and modifyAndOpenFiles:
+		assert _all_stm is not None
+		value = _all_stm.value
+		assert value.lineno is not None
+		assert value.col_offset is not None
+		assert value.end_lineno is not None
+		assert value.end_col_offset is not None
+		start = _line_offsets[value.lineno - 1] + value.col_offset
+		end = _line_offsets[value.end_lineno - 1] + value.end_col_offset
+		new_text = text[:start] + formatList(sorted(_all_set)) + text[end:]
+		with open(full_path, "w", encoding="utf-8") as file:
+			file.write(new_text)
+		modifiedFiles.add(module_fpath)
+	elif has_all:
 		print(module_fpath)
 		print("ADD to __all__:", formatList(add_list))
 		print()
@@ -521,8 +541,9 @@ for module_fpath in sorted(to_check_imported_modules):
 			and isinstance(first.value, ast.Constant)
 			and isinstance(first.value.value, str)
 		):
-			insert_at = sum(
-				len(line) for line in text.splitlines(keepends=True)[: first.end_lineno]
+			assert first.end_lineno is not None
+			insert_at = _line_offsets[first.end_lineno - 1] + len(
+				_lines[first.end_lineno - 1]
 			)
 		new_text = (
 			text[:insert_at] + f"__all__ = {formatList(add_list)}\n" + text[insert_at:]
