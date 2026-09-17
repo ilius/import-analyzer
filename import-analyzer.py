@@ -246,7 +246,6 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			| ast.Continue
 			| ast.Delete
 			| ast.Constant
-			| ast.JoinedStr
 			| ast.Slice
 			| ast.Global,
 		):
@@ -299,7 +298,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 				handleStatement(kw.value)
 			handleStatement(stm.func)
 		elif isinstance(stm, ast.If):
-			handleStatementList([stm.test, *stm.body])
+			handleStatementList([stm.test, *stm.body, *stm.orelse])
 		elif isinstance(stm, ast.Compare):
 			handleStatementList([stm.left, *stm.comparators])
 		elif isinstance(stm, ast.withitem):
@@ -314,6 +313,44 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
 		):
 			handleStatementList(stm.generators)
+			if isinstance(stm, ast.DictComp):
+				handleStatements(stm.key, stm.value)
+			else:
+				handleStatement(stm.elt)
+		elif isinstance(stm, ast.JoinedStr):
+			handleStatementList(stm.values)
+		elif isinstance(stm, ast.FormattedValue):
+			handleStatements(stm.value, stm.format_spec)
+		elif isinstance(stm, ast.Await):
+			handleStatement(stm.value)
+		elif isinstance(stm, ast.AsyncFor):
+			handleStatementList([stm.target, stm.iter, *stm.body, *stm.orelse])
+		elif isinstance(stm, ast.AsyncWith):
+			handleStatementList([*stm.items, *stm.body])
+		elif isinstance(stm, ast.Match):
+			handleStatement(stm.subject)
+			handleStatementList(stm.cases)
+		elif isinstance(stm, ast.match_case):
+			handleStatement(stm.pattern)
+			handleStatement(stm.guard)
+			handleStatementList(stm.body)
+		elif isinstance(stm, ast.MatchValue):
+			handleStatement(stm.value)
+		elif isinstance(stm, ast.MatchSequence):
+			handleStatementList(stm.patterns)
+		elif isinstance(stm, ast.MatchMapping):
+			handleStatementList(stm.keys)
+			handleStatementList(stm.patterns)
+		elif isinstance(stm, ast.MatchClass):
+			handleStatement(stm.cls)
+			handleStatementList(stm.patterns)
+			handleStatementList(stm.kwd_patterns)
+		elif isinstance(stm, ast.MatchAs):
+			handleStatement(stm.pattern)
+		elif isinstance(stm, ast.MatchOr):
+			handleStatementList(stm.patterns)
+		elif isinstance(stm, ast.MatchSingleton | ast.MatchStar):
+			pass
 		elif isinstance(stm, ast.comprehension):
 			handleStatementList([stm.target, stm.iter] + stm.ifs)
 		elif isinstance(stm, ast.Attribute):
@@ -335,7 +372,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			# TODO
 			pass
 		else:
-			print(f"Unknown statemnent type: {stm} with type {type(stm)}")
+			print(f"Unknown statement type: {stm} with type {type(stm)}")
 		return
 
 	with open(fpath, encoding="utf-8") as file_:
