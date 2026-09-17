@@ -58,7 +58,6 @@ config = tool_config.get("import-analyzer") or {}
 re_exclude_list = [re.compile("^" + pat) for pat in config.get("exclude", [])]
 exclude_toplevel_module = set(config.get("exclude_toplevel_module", []))
 
-imported_set: set[str] = set()
 imported_from_by_module_path: dict[str, set[str]] = {}
 
 all_module_attr_access: set[tuple[str, str]] = set()
@@ -154,7 +153,6 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 		return
 	# print(f"{fpathRel = }")
 
-	imports = []
 	imports_by_name = {}
 	attr_access = set()
 
@@ -169,12 +167,9 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			if module_fpath is None:
 				continue
 			if name.asname:
-				imports.append(f"{name.name} as {name.asname}")
 				imports_by_name[name.asname] = (name.name, module_fpath)
 			else:
-				imports.append(name.name)
 				imports_by_name[name.name] = (name.name, module_fpath)
-			imported_set.add(name.name)
 
 	def handleImportFrom(stm: ast.ImportFrom) -> None:
 		module = stm.module
@@ -303,8 +298,6 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			handleStatements(stm.context_expr, stm.optional_vars)
 		elif isinstance(stm, ast.Raise):
 			handleStatement(stm.exc)
-		elif isinstance(stm, ast.Return):
-			handleStatement(stm.value)
 		elif isinstance(stm, ast.Dict):
 			handleStatementList(stm.keys)
 			handleStatementList(stm.values)
@@ -401,8 +394,6 @@ for attr, module_fpath in all_module_attr_access:
 
 slashDunderInit = os.sep + "__init__.py"
 
-skipAllAdd = set()
-
 for module_fpath in sorted(to_check_imported_modules):
 	# print(module, module_fpath)
 	full_path = join(rootDir, module_fpath)
@@ -418,7 +409,7 @@ for module_fpath in sorted(to_check_imported_modules):
 	except Exception as e:
 		print(f"failed to parse {module_fpath=}: {e}", file=sys.stderr)
 		continue
-	_all_stm, _all = find__all__(code)
+	_, _all = find__all__(code)
 	has_all = False
 	if _all is None:
 		_all_set = set()
@@ -433,7 +424,6 @@ for module_fpath in sorted(to_check_imported_modules):
 			if module_fpath.endswith(slashDunderInit):
 				moduleDirName = join(dirname(module_fpath), name)
 				if isfile(moduleDirName + ".py") or isdir(moduleDirName):
-					skipAllAdd.add((module_fpath, name))
 					continue
 			_all_set.add(name)
 	names2 = module_attr_access_by_fpath.get(module_fpath)
@@ -471,38 +461,6 @@ for module_fpath in sorted(to_check_imported_modules):
 		print(module_fpath)
 		print("__all__ =", formatList(add_list))
 		print()
-
-	# if _all_stm is not None:
-	# 	_all_stm.value.elts = [
-	# 		ast.Constant(value=value)
-	# 		for value in _all
-	# 	]
-	# else:
-	# 	for index, stm in enumerate(code.body):
-	# 		if isinstance(stm, (
-	# 			ast.Assign,
-	# 			ast.FunctionDef,
-	# 			ast.ClassDef,
-	# 		)):
-	# 			break
-	# 	code.body.insert(index, ast.Assign(
-	# 		targets=[ast.Name("__all__", None)],
-	# 		value=ast.List(elts=[
-	# 			ast.Constant(value=value)
-	# 			for value in _all
-	# 		]),
-	# 	))
-
-	# lines = text.split("\n")
-	# for line in lines:
-	#
-	# code_formatted = ast.unparse(code)
-	# with open(full_path, mode="w") as _file:
-	# 	_file.write(code_formatted)
-	# print("Updated", full_path)
-
-# for module_fpath, name in skipAllAdd:
-# 	print(f"Skipped adding to __all__: {name} from {module_fpath}")
 
 
 if modifiedFiles:
