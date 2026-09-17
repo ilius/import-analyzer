@@ -127,14 +127,14 @@ def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
 		# print(target)
 		if target.id != "__all__":
 			continue
-		if isinstance(stm.value, ast.Tuple):
-			print("WARNING: __all__ is a tuple: ", code)
-		assert isinstance(stm.value, ast.List | ast.Tuple), f"{stm.value=}"
-		assert len(stm.targets) == 1
-		# stm.value.elts[i]: ast.Constant
+		if not isinstance(stm.value, ast.List | ast.Tuple):
+			return None, None
+		if len(stm.targets) != 1:
+			return None, None
 		all_ = []
 		for elem in stm.value.elts:
-			assert isinstance(elem, ast.Constant)
+			if not isinstance(elem, ast.Constant) or not isinstance(elem.value, str):
+				return None, None
 			all_.append(elem.value)
 		return stm, all_
 	return None, None
