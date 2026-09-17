@@ -127,7 +127,9 @@ def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
 		# print(target)
 		if target.id != "__all__":
 			continue
-		assert isinstance(stm.value, ast.List)
+		if isinstance(stm.value, ast.Tuple):
+			print("WARNING: __all__ is a tuple: ", code)
+		assert isinstance(stm.value, ast.List | ast.Tuple), f"{stm.value=}"
 		assert len(stm.targets) == 1
 		# stm.value.elts[i]: ast.Constant
 		all_ = []
@@ -251,13 +253,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			handleStatementList(stm.targets)
 		elif isinstance(stm, ast.AugAssign):
 			handleStatements(stm.target, stm.value)
-		elif isinstance(stm, ast.Expr):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.Return):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.Yield):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.YieldFrom):
+		elif isinstance(stm, (ast.Expr, ast.Return, ast.Yield, ast.YieldFrom)):
 			handleStatement(stm.value)
 		elif isinstance(stm, ast.Assert):
 			handleStatements(stm.test, stm.msg)
@@ -341,8 +337,8 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			print(f"Unknown statemnent type: {stm} with type {type(stm)}")
 		return
 
-	with open(fpath, encoding="utf-8") as _file:
-		text = _file.read()
+	with open(fpath, encoding="utf-8") as file_:
+		text = file_.read()
 	try:
 		code = ast.parse(text)
 	except Exception as e:
@@ -359,13 +355,13 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 
 		handleStatement(stm)
 
-	for _id, attr in attr_access:
-		if _id in {"self", "msg"}:
+	for id_, attr in attr_access:
+		if id_ in {"self", "msg"}:
 			continue
-		if _id not in imports_by_name:
+		if id_ not in imports_by_name:
 			# print(f"{fpathRel}: {_id}.{attr}  (Unknown)")
 			continue
-		_module, module_fpath = imports_by_name[_id]
+		_module, module_fpath = imports_by_name[id_]
 		# print(f"{fpathRel}: {module}.{attr} from file ({module_fpath})")
 		all_module_attr_access.add((attr, module_fpath))
 
@@ -452,6 +448,8 @@ for module_fpath in sorted(to_check_imported_modules):
 		unused_set = _all_set_current.difference(used_set)
 		# print(f"{module_fpath}: used {sorted(used_set)}")
 		for symbol in sorted(unused_set):
+			if symbol.startswith("__") and symbol.endswith("__"):
+				continue
 			print(f"{module_fpath}: unused symbol {symbol} in __all__")
 
 	if len(_all_set) == len(_all_set_current):
