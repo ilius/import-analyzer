@@ -155,7 +155,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 	# print(f"{fpathRel = }")
 
 	imports_by_name: dict[str, tuple[str, str | None]] = {}
-	attr_access = set()
+	attr_access: set[tuple[str, str, int]] = set()
 
 	def handleImport(stm: ast.Import) -> None:
 		for name in stm.names:
@@ -170,7 +170,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 			if name.asname:
 				imports_by_name[name.asname] = (name.name, module_fpath)
 			else:
-				imports_by_name[name.name] = (name.name, module_fpath)
+				imports_by_name[name.name.split(".")[0]] = (name.name, module_fpath)
 
 	def handleImportFrom(stm: ast.ImportFrom) -> None:
 		module = stm.module
@@ -209,8 +209,15 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 
 	def handleAttribute(stm: ast.Attribute) -> None:
 		assert isinstance(stm.attr, str)
-		if isinstance(stm.value, ast.Name):
-			attr_access.add((stm.value.id, stm.attr))
+		attrs = []
+		node: ast.AST = stm
+		while isinstance(node, ast.Attribute):
+			attrs.append(node.attr)
+			node = node.value
+		if isinstance(node, ast.Name):
+			depth = len(attrs)
+			for i, attr in enumerate(attrs):
+				attr_access.add((node.id, attr, depth - i))
 		else:
 			handleStatement(stm.value)
 
@@ -349,15 +356,33 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 
 		handleStatement(stm)
 
-	for id_, attr in attr_access:
+	attr_access_by_name: dict[str, list[tuple[str, int]]] = {}
+	for id_, attr, depth in attr_access:
+		attr_access_by_name.setdefault(id_, []).append((attr, depth))
+
+	for id_, items in attr_access_by_name.items():
 		if id_ in {"self", "msg"}:
 			continue
 		if id_ not in imports_by_name:
-			# print(f"{fpathRel}: {_id}.{attr}  (Unknown)")
+			# print(f"{fpathRel}: {id_}.{attr}  (Unknown)")
 			continue
 		_module, module_fpath = imports_by_name[id_]
-		# print(f"{fpathRel}: {module}.{attr} from file ({module_fpath})")
-		all_module_attr_access.add((attr, module_fpath))
+		if module_fpath is None:
+			continue
+		module_parts = _module.split(".")
+		if len(module_parts) > 1 and id_ == module_parts[0]:
+			# unaliased dotted import: submodule-deref hops come first,
+			# the actual symbols are the deepest hops
+			max_depth = max(item[1] for item in items)
+			for attr, depth in items:
+				if depth == max_depth and attr != module_parts[-1]:
+					all_module_attr_access.add((attr, module_fpath))
+		else:
+			# plain or aliased import: keep all first-level attributes
+			min_depth = min(item[1] for item in items)
+			for attr, depth in items:
+				if depth == min_depth:
+					all_module_attr_access.add((attr, module_fpath))
 
 	# print(json.dumps(list(attr_access)))
 
