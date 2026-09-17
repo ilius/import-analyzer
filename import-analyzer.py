@@ -515,11 +515,23 @@ for module_fpath in sorted(to_check_imported_modules):
 		print("ADD to __all__:", formatList(add_list))
 		print()
 	elif modifyAndOpenFiles:
-		with open(module_fpath, encoding="utf-8") as file:
-			text = file.read()
-		text = f"__all__ = {add_list!r}" + "\n" + text
-		with open(module_fpath, "w", encoding="utf-8") as file:
-			file.write(text)
+		insert_at = 0
+		first = code.body[0] if code.body else None
+		if (
+			isinstance(first, ast.Expr)
+			and isinstance(first.value, ast.Constant)
+			and isinstance(first.value.value, str)
+		):
+			insert_at = sum(
+				len(line) for line in text.splitlines(keepends=True)[: first.end_lineno]
+			)
+		new_text = (
+			text[:insert_at]
+			+ f"__all__ = {formatList(add_list)}\n"
+			+ text[insert_at:]
+		)
+		with open(full_path, "w", encoding="utf-8") as file:
+			file.write(new_text)
 		modifiedFiles.add(module_fpath)
 	else:
 		print(module_fpath)
