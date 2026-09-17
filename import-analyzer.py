@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import warnings
+from collections.abc import Sequence
 from functools import lru_cache
 from os.path import dirname, isdir, isfile, join, realpath, split
 
@@ -50,8 +51,8 @@ if not rootDir.endswith("/"):
 	rootDir += "/"
 print(f"Root Dir: {rootDir}")
 
-with open(join(rootDir, "pyproject.toml"), "rb") as _file:
-	full_config = tomllib.load(_file)
+with open(join(rootDir, "pyproject.toml"), "rb") as _cfg_file:
+	full_config = tomllib.load(_cfg_file)
 tool_config = full_config.get("tool") or {}
 config = tool_config.get("import-analyzer") or {}
 
@@ -153,7 +154,7 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 		return
 	# print(f"{fpathRel = }")
 
-	imports_by_name = {}
+	imports_by_name: dict[str, tuple[str, str | None]] = {}
 	attr_access = set()
 
 	def handleImport(stm: ast.Import) -> None:
@@ -213,15 +214,15 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 		else:
 			handleStatement(stm.value)
 
-	def handleStatementList(statements: list[ast.stmt | ast.expr | None]) -> None:
+	def handleStatementList(statements: Sequence[ast.AST | None]) -> None:
 		for stm in statements:
 			handleStatement(stm)
 
-	def handleStatements(*statements: ast.stmt | ast.expr | None) -> None:
+	def handleStatements(*statements: ast.AST | None) -> None:
 		for stm in statements:
 			handleStatement(stm)
 
-	def handleStatement(stm: ast.stmt | ast.expr | None) -> None:
+	def handleStatement(stm: ast.AST | None) -> None:
 		if stm is None:
 			return
 		if isinstance(stm, ast.Import):
@@ -265,25 +266,25 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 		elif isinstance(stm, ast.Subscript):
 			handleStatements(stm.value, stm.slice)
 		elif isinstance(stm, ast.With):
-			handleStatementList(stm.items + stm.body)
+			handleStatementList([*stm.items, *stm.body])
 		elif isinstance(stm, ast.List | ast.Tuple | ast.Set):
 			handleStatementList(stm.elts)
 		elif isinstance(stm, ast.Lambda):
 			handleStatement(stm.body)
 		elif isinstance(stm, ast.For):
-			handleStatementList([stm.target, stm.iter] + stm.body + stm.orelse)
+			handleStatementList([stm.target, stm.iter, *stm.body, *stm.orelse])
 		elif isinstance(stm, ast.While):
-			handleStatementList([stm.test] + stm.body + stm.orelse)
+			handleStatementList([stm.test, *stm.body, *stm.orelse])
 		elif isinstance(stm, ast.BinOp):
 			handleStatements(stm.left, stm.right)
 		elif isinstance(stm, ast.UnaryOp):
 			handleStatement(stm.operand)
 		elif isinstance(stm, ast.Try):
 			handleStatementList(
-				stm.body + stm.handlers + stm.orelse + stm.finalbody,
+				[*stm.body, *stm.handlers, *stm.orelse, *stm.finalbody],
 			)
 		elif isinstance(stm, ast.ExceptHandler):
-			handleStatementList([stm.type] + stm.body)
+			handleStatementList([stm.type, *stm.body])
 		elif isinstance(stm, ast.Call):
 			for arg in stm.args:
 				handleStatement(arg)
@@ -291,9 +292,9 @@ def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
 				handleStatement(kw.value)
 			handleStatement(stm.func)
 		elif isinstance(stm, ast.If):
-			handleStatementList([stm.test] + stm.body)
+			handleStatementList([stm.test, *stm.body])
 		elif isinstance(stm, ast.Compare):
-			handleStatementList([stm.left] + stm.comparators)
+			handleStatementList([stm.left, *stm.comparators])
 		elif isinstance(stm, ast.withitem):
 			handleStatements(stm.context_expr, stm.optional_vars)
 		elif isinstance(stm, ast.Raise):
@@ -381,7 +382,7 @@ for _attr, module_fpath in all_module_attr_access:
 	to_check_imported_modules.add(module_fpath)
 
 
-module_attr_access_by_fpath = {}
+module_attr_access_by_fpath: dict[str, set[str]] = {}
 for attr, module_fpath in all_module_attr_access:
 	if module_fpath is None:
 		continue
