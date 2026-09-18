@@ -8,7 +8,7 @@ import re
 import subprocess
 import sys
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Iterable, Sequence
 from functools import lru_cache
 from os.path import dirname, isdir, isfile, join, realpath, split
 
@@ -16,105 +16,61 @@ import tomllib
 
 warnings.simplefilter("ignore")
 
-editor = os.getenv("IDE", "xdg-open")
-modifiedFiles = set()
-
-parser = argparse.ArgumentParser(
-	prog=sys.argv[0],
-	add_help=False,
-	# allow_abbrev=False,
+# AST node types with no traversable children.
+_LEAF_TYPES: tuple[type[ast.AST], ...] = (
+	ast.Name,
+	ast.Pass,
+	ast.Break,
+	ast.Continue,
+	ast.Delete,
+	ast.Constant,
+	ast.Slice,
+	ast.Global,
+	ast.Nonlocal,
+	ast.MatchSingleton,
+	ast.MatchStar,
 )
-parser.add_argument(
-	"--no-modify",
-	action="store_true",
-	help="do not modify files, only print",
-)
-parser.add_argument(
-	"scan_dir",
-	action="store",
-	default=".",
-	nargs="?",
-)
-args = parser.parse_args()
-
-modifyAndOpenFiles = not args.no_modify
-
-scanDir = realpath(args.scan_dir)
-
-rootDir = scanDir
-scanDirParts = scanDir.split("/")
-for count in range(len(scanDirParts), 1, -1):
-	_testDir = join("/", *scanDirParts[:count])
-	if isfile(join(_testDir, "pyproject.toml")):
-		rootDir = _testDir
-if not rootDir.endswith("/"):
-	rootDir += "/"
-print(f"Root Dir: {rootDir}")
-
-with open(join(rootDir, "pyproject.toml"), "rb") as _cfg_file:
-	full_config = tomllib.load(_cfg_file)
-tool_config = full_config.get("tool") or {}
-config = tool_config.get("import-analyzer") or {}
-
-re_exclude_list = [re.compile("^" + pat) for pat in config.get("exclude", [])]
-exclude_toplevel_module = set(config.get("exclude_toplevel_module", []))
-
-imported_from_by_module_path: dict[str, set[str]] = {}
-
-all_module_attr_access: set[tuple[str, str]] = set()
 
 
-@lru_cache(maxsize=None, typed=False)
-def is_excluded(fpath: str) -> bool:
-	return any(pat.match(fpath) for pat in re_exclude_list)
+def _all_children(node: ast.AST) -> Iterable[ast.AST | None]:
+	return ast.iter_child_nodes(node)
+
+
+def _function_children(
+	node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> Sequence[ast.AST | None]:
+	return (*node.args.defaults, *node.body, *node.decorator_list)
+
+
+def _class_children(node: ast.ClassDef) -> Sequence[ast.AST | None]:
+	return tuple(node.body)
+
+
+def _lambda_children(node: ast.Lambda) -> Sequence[ast.AST | None]:
+	return (node.body,)
+
+
+def _raise_children(node: ast.Raise) -> Sequence[ast.AST | None]:
+	return (node.exc,)
+
+
+def _no_children(_node: ast.AST) -> Sequence[ast.AST | None]:
+	return ()
+
+
+# AST node types whose traversal differs from "visit every child node".
+_CHILD_GETTERS: dict[type[ast.AST], Callable[..., Iterable[ast.AST | None]]] = {
+	ast.FunctionDef: _function_children,
+	ast.AsyncFunctionDef: _function_children,
+	ast.ClassDef: _class_children,
+	ast.Lambda: _lambda_children,
+	ast.Raise: _raise_children,
+	ast.TypeAlias: _no_children,
+}
 
 
 def formatList(lst: list[str]) -> str:
 	return json.dumps(lst)
-
-
-@lru_cache(maxsize=None, typed=False)
-def moduleFilePath(
-	module: str,
-	dirPathRel: str,
-	subDirs: list[str],
-	files: list[str],
-	silent: bool = False,
-) -> str | None:
-	if not module:
-		return None
-	parts = module.split(".")
-	if not parts:
-		return None
-	main = parts[0]
-	if main in sys.stdlib_module_names:
-		return None
-	if main in exclude_toplevel_module:
-		return None
-	if main in files or main + ".py" in files or main in subDirs:
-		parts = list(split(dirPathRel)) + parts
-	# else:
-	# 	try:
-	# 		mod = __import__(main)
-	# 	except ModuleNotFoundError:
-	# 		pass
-	# 	except Exception as e:
-	# 		print(f"error importing {main}: {e}", file=sys.stderr)
-
-	pathRel = join(*parts)
-	dpath = join(rootDir, pathRel)
-	if isdir(dpath):
-		if isfile(join(dpath, "__init__.py")):
-			return join(pathRel, "__init__.py")
-		return None
-	if isfile(dpath + ".py"):
-		return pathRel + ".py"
-	if not silent:
-		print(
-			f"Unknown module {module}: {pathRel=}, used in {dirPathRel}",
-			file=sys.stderr,
-		)
-	return None
 
 
 def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
@@ -140,400 +96,286 @@ def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
 	return None, None
 
 
-def processFile(dirPathRel: str, fname: str, subDirs: list[str]) -> None:
-	if not fname.endswith(".py"):
-		return
-	fpath = join(dirPath, fname)
-	if is_excluded(fpath):
-		return
-	# print(fpath)
-	# strip rootDir prefix
-	fpathRel = fpath[len(rootDir) :]
+class ImportAnalyzer:
+	def __init__(self, scan_dir: str, modify_and_open_files: bool) -> None:
+		self.modify_and_open_files = modify_and_open_files
+		self.editor = os.getenv("IDE", "xdg-open")
+		self.modified_files: set[str] = set()
+		self.scan_dir = realpath(scan_dir)
+		self.root_dir = self._findRootDir(self.scan_dir)
+		self.imported_from_by_module_path: dict[str, set[str]] = {}
+		self.all_module_attr_access: set[tuple[str, str]] = set()
+		self.exclude_toplevel_module: set[str] = set()
+		self._loadConfig()
 
-	if is_excluded(fpathRel):
-		return
-	# print(f"{fpathRel = }")
+	def _findRootDir(self, scan_dir: str) -> str:
+		root_dir = scan_dir
+		parts = scan_dir.split("/")
+		for count in range(len(parts), 1, -1):
+			test_dir = join("/", *parts[:count])
+			if isfile(join(test_dir, "pyproject.toml")):
+				root_dir = test_dir
+		if not root_dir.endswith("/"):
+			root_dir += "/"
+		print(f"Root Dir: {root_dir}")
+		return root_dir
 
-	imports_by_name: dict[str, tuple[str, str | None]] = {}
-	attr_access: set[tuple[str, str, int]] = set()
+	def _loadConfig(self) -> None:
+		with open(join(self.root_dir, "pyproject.toml"), "rb") as file_:
+			full_config = tomllib.load(file_)
+		config = (full_config.get("tool") or {}).get("import-analyzer") or {}
+		self.exclude_toplevel_module = set(config.get("exclude_toplevel_module", []))
+		re_exclude_list = [re.compile("^" + pat) for pat in config.get("exclude", [])]
 
-	def handleImport(stm: ast.Import) -> None:
-		for name in stm.names:
-			module_fpath = moduleFilePath(
-				name.name,
+		@lru_cache(maxsize=None, typed=False)
+		def is_excluded(fpath: str) -> bool:
+			return any(pat.match(fpath) for pat in re_exclude_list)
+
+		@lru_cache(maxsize=None, typed=False)
+		def moduleFilePath(
+			module: str,
+			dirPathRel: str,
+			subDirs: tuple[str, ...],
+			files: tuple[str, ...],
+			silent: bool = False,
+		) -> str | None:
+			if not module:
+				return None
+			parts = module.split(".")
+			if not parts:
+				return None
+			main = parts[0]
+			if main in sys.stdlib_module_names:
+				return None
+			if main in self.exclude_toplevel_module:
+				return None
+			if main in files or main + ".py" in files or main in subDirs:
+				parts = list(split(dirPathRel)) + parts
+			# else:
+			# 	try:
+			# 		mod = __import__(main)
+			# 	except ModuleNotFoundError:
+			# 		pass
+			# 	except Exception as e:
+			# 		print(f"error importing {main}: {e}", file=sys.stderr)
+
+			pathRel = join(*parts)
+			dpath = join(self.root_dir, pathRel)
+			if isdir(dpath):
+				if isfile(join(dpath, "__init__.py")):
+					return join(pathRel, "__init__.py")
+				return None
+			if isfile(dpath + ".py"):
+				return pathRel + ".py"
+			if not silent:
+				print(
+					f"Unknown module {module}: {pathRel=}, used in {dirPathRel}",
+					file=sys.stderr,
+				)
+			return None
+
+		self.is_excluded = is_excluded
+		self.moduleFilePath = moduleFilePath
+
+	def processFile(
+		self, dirPathRel: str, fname: str, subDirs: list[str], files: list[str]
+	) -> None:
+		if not fname.endswith(".py"):
+			return
+		fpath = join(self.root_dir, dirPathRel, fname)
+		if self.is_excluded(fpath):
+			return
+		# strip rootDir prefix
+		fpathRel = fpath[len(self.root_dir) :]
+
+		if self.is_excluded(fpathRel):
+			return
+		# print(f"{fpathRel = }")
+
+		imports_by_name: dict[str, tuple[str, str | None]] = {}
+		attr_access: set[tuple[str, str, int]] = set()
+
+		def handleImport(stm: ast.Import) -> None:
+			for name in stm.names:
+				module_fpath = self.moduleFilePath(
+					name.name,
+					dirPathRel,
+					tuple(subDirs),
+					tuple(files),
+				)
+				if module_fpath is None:
+					continue
+				if name.asname:
+					imports_by_name[name.asname] = (name.name, module_fpath)
+				else:
+					imports_by_name[name.name.split(".")[0]] = (name.name, module_fpath)
+
+		def handleImportFrom(stm: ast.ImportFrom) -> None:
+			module = stm.module
+			if module is None:
+				# print(f"{module = }, {stm!r}", file=sys.stderr)
+				module = dirPathRel.replace("/", ".")
+			module_fpath = self.moduleFilePath(
+				module,
 				dirPathRel,
 				tuple(subDirs),
 				tuple(files),
 			)
 			if module_fpath is None:
-				continue
-			if name.asname:
-				imports_by_name[name.asname] = (name.name, module_fpath)
-			else:
-				imports_by_name[name.name.split(".")[0]] = (name.name, module_fpath)
-
-	def handleImportFrom(stm: ast.ImportFrom) -> None:
-		module = stm.module
-		if module is None:
-			# print(f"{module = }, {stm!r}", file=sys.stderr)
-			module = dirPathRel.replace("/", ".")
-		module_fpath = moduleFilePath(
-			module,
-			dirPathRel,
-			tuple(subDirs),
-			tuple(files),
-		)
-		if module_fpath is None:
-			return
-		try:
-			import_froms_set = imported_from_by_module_path[module_fpath]
-		except KeyError:
-			import_froms_set = imported_from_by_module_path[module_fpath] = set()
-		for name in stm.names:
-			if not name.name:
-				# print(f"{name = }", file=sys.stderr)
-				continue
-			full_name = module + "." + name.name
-			tmp_module_fpath = moduleFilePath(
-				full_name,
-				dirPathRel,
-				tuple(subDirs),
-				tuple(files),
-				silent=True,
+				return
+			import_froms_set = self.imported_from_by_module_path.setdefault(
+				module_fpath, set()
 			)
-			if name.asname:
-				imports_by_name[name.asname] = (full_name, tmp_module_fpath)
-			else:
-				imports_by_name[name.name] = (full_name, tmp_module_fpath)
-			import_froms_set.add(name.name)
-
-	def handleAttribute(stm: ast.Attribute) -> None:
-		assert isinstance(stm.attr, str)
-		attrs = []
-		node: ast.AST = stm
-		while isinstance(node, ast.Attribute):
-			attrs.append(node.attr)
-			node = node.value
-		if isinstance(node, ast.Name):
-			depth = len(attrs)
-			for i, attr in enumerate(attrs):
-				attr_access.add((node.id, attr, depth - i))
-		else:
-			handleStatement(stm.value)
-
-	def handleStatementList(statements: Sequence[ast.AST | None]) -> None:
-		for stm in statements:
-			handleStatement(stm)
-
-	def handleStatements(*statements: ast.AST | None) -> None:
-		for stm in statements:
-			handleStatement(stm)
-
-	def handleStatement(stm: ast.AST | None) -> None:
-		if stm is None:
-			return
-		if isinstance(stm, ast.Import):
-			handleImport(stm)
-		elif isinstance(stm, ast.ImportFrom):
-			handleImportFrom(stm)
-		elif isinstance(stm, ast.Name):
-			# print(f"name: id={stm.id}")
-			pass
-		elif isinstance(
-			stm,
-			ast.Pass
-			| ast.Break
-			| ast.Continue
-			| ast.Delete
-			| ast.Constant
-			| ast.Slice
-			| ast.Global,
-		):
-			pass
-		elif isinstance(stm, ast.Assign):
-			handleStatement(stm.value)
-			handleStatementList(stm.targets)
-		elif isinstance(stm, ast.AugAssign):
-			handleStatements(stm.target, stm.value)
-		elif isinstance(stm, (ast.Expr, ast.Return, ast.Yield, ast.YieldFrom)):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.Assert):
-			handleStatements(stm.test, stm.msg)
-		elif isinstance(stm, ast.IfExp):
-			handleStatements(stm.test, stm.body, stm.orelse)
-		elif isinstance(stm, ast.FunctionDef):
-			handleStatementList(stm.args.defaults)
-			handleStatementList(stm.body)
-			handleStatementList(stm.decorator_list)
-		elif isinstance(stm, ast.ClassDef):
-			handleStatementList(stm.body)
-		elif isinstance(stm, ast.BoolOp):
-			handleStatementList(stm.values)
-		elif isinstance(stm, ast.Subscript):
-			handleStatements(stm.value, stm.slice)
-		elif isinstance(stm, ast.With):
-			handleStatementList([*stm.items, *stm.body])
-		elif isinstance(stm, ast.List | ast.Tuple | ast.Set):
-			handleStatementList(stm.elts)
-		elif isinstance(stm, ast.Lambda):
-			handleStatement(stm.body)
-		elif isinstance(stm, ast.For):
-			handleStatementList([stm.target, stm.iter, *stm.body, *stm.orelse])
-		elif isinstance(stm, ast.While):
-			handleStatementList([stm.test, *stm.body, *stm.orelse])
-		elif isinstance(stm, ast.BinOp):
-			handleStatements(stm.left, stm.right)
-		elif isinstance(stm, ast.UnaryOp):
-			handleStatement(stm.operand)
-		elif isinstance(stm, ast.Try):
-			handleStatementList(
-				[*stm.body, *stm.handlers, *stm.orelse, *stm.finalbody],
-			)
-		elif isinstance(stm, ast.ExceptHandler):
-			handleStatementList([stm.type, *stm.body])
-		elif isinstance(stm, ast.Call):
-			for arg in stm.args:
-				handleStatement(arg)
-			for kw in stm.keywords:
-				handleStatement(kw.value)
-			handleStatement(stm.func)
-		elif isinstance(stm, ast.If):
-			handleStatementList([stm.test, *stm.body, *stm.orelse])
-		elif isinstance(stm, ast.Compare):
-			handleStatementList([stm.left, *stm.comparators])
-		elif isinstance(stm, ast.withitem):
-			handleStatements(stm.context_expr, stm.optional_vars)
-		elif isinstance(stm, ast.Raise):
-			handleStatement(stm.exc)
-		elif isinstance(stm, ast.Dict):
-			handleStatementList(stm.keys)
-			handleStatementList(stm.values)
-		elif isinstance(
-			stm,
-			ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp,
-		):
-			handleStatementList(stm.generators)
-			if isinstance(stm, ast.DictComp):
-				handleStatements(stm.key, stm.value)
-			else:
-				handleStatement(stm.elt)
-		elif isinstance(stm, ast.JoinedStr):
-			handleStatementList(stm.values)
-		elif isinstance(stm, ast.FormattedValue):
-			handleStatements(stm.value, stm.format_spec)
-		elif isinstance(stm, ast.Await):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.AsyncFor):
-			handleStatementList([stm.target, stm.iter, *stm.body, *stm.orelse])
-		elif isinstance(stm, ast.AsyncWith):
-			handleStatementList([*stm.items, *stm.body])
-		elif isinstance(stm, ast.Match):
-			handleStatement(stm.subject)
-			handleStatementList(stm.cases)
-		elif isinstance(stm, ast.match_case):
-			handleStatement(stm.pattern)
-			handleStatement(stm.guard)
-			handleStatementList(stm.body)
-		elif isinstance(stm, ast.MatchValue):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.MatchSequence):
-			handleStatementList(stm.patterns)
-		elif isinstance(stm, ast.MatchMapping):
-			handleStatementList(stm.keys)
-			handleStatementList(stm.patterns)
-		elif isinstance(stm, ast.MatchClass):
-			handleStatement(stm.cls)
-			handleStatementList(stm.patterns)
-			handleStatementList(stm.kwd_patterns)
-		elif isinstance(stm, ast.MatchAs):
-			handleStatement(stm.pattern)
-		elif isinstance(stm, ast.MatchOr):
-			handleStatementList(stm.patterns)
-		elif isinstance(stm, ast.MatchSingleton | ast.MatchStar):
-			pass
-		elif isinstance(stm, ast.comprehension):
-			handleStatementList([stm.target, stm.iter] + stm.ifs)
-		elif isinstance(stm, ast.Attribute):
-			handleAttribute(stm)
-		elif isinstance(stm, ast.AnnAssign):
-			handleStatements(stm.target, stm.annotation, stm.value)
-		elif isinstance(stm, ast.NamedExpr):
-			handleStatements(stm.target, stm.value)
-		elif isinstance(stm, ast.AsyncFunctionDef):
-			handleStatementList(stm.args.defaults)
-			handleStatementList(stm.body)
-			handleStatementList(stm.decorator_list)
-		elif isinstance(stm, ast.Starred):
-			handleStatement(stm.value)
-		elif isinstance(stm, ast.Nonlocal):
-			# stm.names is list[str]
-			pass
-		elif isinstance(stm, ast.TypeAlias):
-			# TODO
-			pass
-		else:
-			print(f"Unknown statement type: {stm} with type {type(stm)}")
-		return
-
-	with open(fpath, encoding="utf-8") as file_:
-		text = file_.read()
-	try:
-		code = ast.parse(text)
-	except Exception as e:
-		print(f"failed to parse {fpath}: {e}", file=sys.stderr)
-		return
-	for stm in code.body:
-		if isinstance(stm, ast.Import):
-			handleImport(stm)
-			continue
-
-		if isinstance(stm, ast.ImportFrom):
-			handleImportFrom(stm)
-			continue
-
-		handleStatement(stm)
-
-	attr_access_by_name: dict[str, list[tuple[str, int]]] = {}
-	for id_, attr, depth in attr_access:
-		attr_access_by_name.setdefault(id_, []).append((attr, depth))
-
-	for id_, items in attr_access_by_name.items():
-		if id_ in {"self", "msg"}:
-			continue
-		if id_ not in imports_by_name:
-			# print(f"{fpathRel}: {id_}.{attr}  (Unknown)")
-			continue
-		_module, module_fpath = imports_by_name[id_]
-		if module_fpath is None:
-			continue
-		module_parts = _module.split(".")
-		if len(module_parts) > 1 and id_ == module_parts[0]:
-			# unaliased dotted import: submodule-deref hops come first,
-			# the actual symbols are the deepest hops
-			max_depth = max(item[1] for item in items)
-			for attr, depth in items:
-				if depth == max_depth and attr != module_parts[-1]:
-					all_module_attr_access.add((attr, module_fpath))
-		else:
-			# plain or aliased import: keep all first-level attributes
-			min_depth = min(item[1] for item in items)
-			for attr, depth in items:
-				if depth == min_depth:
-					all_module_attr_access.add((attr, module_fpath))
-
-	# print(json.dumps(list(attr_access)))
-
-
-for dirPath, subDirs, files in os.walk(scanDir):
-	dirPathRel = dirPath[len(rootDir) :]
-
-	for fname in files:
-		processFile(dirPathRel, fname, subDirs)
-
-
-to_check_imported_modules = set()
-for module_fpath in imported_from_by_module_path:
-	if module_fpath is None:
-		continue
-	to_check_imported_modules.add(module_fpath)
-
-
-for _attr, module_fpath in all_module_attr_access:
-	if module_fpath is None:
-		continue
-	to_check_imported_modules.add(module_fpath)
-
-
-module_attr_access_by_fpath: dict[str, set[str]] = {}
-for attr, module_fpath in all_module_attr_access:
-	if module_fpath is None:
-		continue
-	try:
-		attrs = module_attr_access_by_fpath[module_fpath]
-	except KeyError:
-		attrs = module_attr_access_by_fpath[module_fpath] = set()
-	attrs.add(attr)
-
-
-slashDunderInit = os.sep + "__init__.py"
-
-for module_fpath in sorted(to_check_imported_modules):
-	# print(module, module_fpath)
-	full_path = join(rootDir, module_fpath)
-	with open(full_path, encoding="utf-8") as _file:
-		text = _file.read()
-	if is_excluded(module_fpath):
-		continue
-	module_top = module_fpath.split("/")[0]
-	if module_top in exclude_toplevel_module:
-		continue
-	try:
-		code = ast.parse(text)
-	except Exception as e:
-		print(f"failed to parse {module_fpath=}: {e}", file=sys.stderr)
-		continue
-	_all_stm, _all = find__all__(code)
-	has_all = False
-	_all_set = set()
-	_all_set_current = set()
-	if _all is not None:
-		has_all = True
-		_all_set = set(_all)
-		_all_set_current = _all_set.copy()
-	names1 = imported_from_by_module_path.get(module_fpath)
-	if names1:
-		for name in names1:
-			if module_fpath.endswith(slashDunderInit):
-				moduleDirName = join(dirname(module_fpath), name)
-				if isfile(moduleDirName + ".py") or isdir(moduleDirName):
+			for name in stm.names:
+				if not name.name:
+					# print(f"{name = }", file=sys.stderr)
 					continue
-			_all_set.add(name)
-	names2 = module_attr_access_by_fpath.get(module_fpath)
-	if names2:
-		_all_set.update(names2)
-	_all_set.discard("*")
-	_all_set_current.discard("*")
-	if not _all_set:
-		continue
+				full_name = module + "." + name.name
+				tmp_module_fpath = self.moduleFilePath(
+					full_name,
+					dirPathRel,
+					tuple(subDirs),
+					tuple(files),
+					silent=True,
+				)
+				if name.asname:
+					imports_by_name[name.asname] = (full_name, tmp_module_fpath)
+				else:
+					imports_by_name[name.name] = (full_name, tmp_module_fpath)
+				import_froms_set.add(name.name)
 
-	if has_all:
-		used_set = set(names1 or []) | set(names2 or [])
-		unused_set = _all_set_current.difference(used_set)
-		# print(f"{module_fpath}: used {sorted(used_set)}")
-		for symbol in sorted(unused_set):
-			if symbol.startswith("__") and symbol.endswith("__"):
+		def handleAttribute(stm: ast.Attribute) -> None:
+			assert isinstance(stm.attr, str)
+			attrs = []
+			node: ast.AST = stm
+			while isinstance(node, ast.Attribute):
+				attrs.append(node.attr)
+				node = node.value
+			if isinstance(node, ast.Name):
+				depth = len(attrs)
+				for i, attr in enumerate(attrs):
+					attr_access.add((node.id, attr, depth - i))
+			else:
+				handleStatement(stm.value)
+
+		def handleStatement(stm: ast.AST | None) -> None:
+			if stm is None:
+				return
+			if isinstance(stm, ast.Import):
+				handleImport(stm)
+			elif isinstance(stm, ast.ImportFrom):
+				handleImportFrom(stm)
+			elif isinstance(stm, ast.Attribute):
+				handleAttribute(stm)
+			elif isinstance(stm, _LEAF_TYPES):
+				return
+			else:
+				getter = _CHILD_GETTERS.get(type(stm), _all_children)
+				for child in getter(stm):
+					handleStatement(child)
+
+		with open(fpath, encoding="utf-8") as file_:
+			text = file_.read()
+		try:
+			code = ast.parse(text)
+		except Exception as e:
+			print(f"failed to parse {fpath}: {e}", file=sys.stderr)
+			return
+		for stm in code.body:
+			if isinstance(stm, ast.Import):
+				handleImport(stm)
 				continue
-			print(f"{module_fpath}: unused symbol {symbol} in __all__")
 
-	add_list = sorted(_all_set.difference(_all_set_current))
-	if not add_list:
-		continue
+			if isinstance(stm, ast.ImportFrom):
+				handleImportFrom(stm)
+				continue
 
-	_lines = text.splitlines(keepends=True)
-	_line_offsets = []
-	_offset = 0
-	for _line in _lines:
-		_line_offsets.append(_offset)
-		_offset += len(_line)
+			handleStatement(stm)
 
-	if has_all and modifyAndOpenFiles:
-		assert _all_stm is not None
-		value = _all_stm.value
+		attr_access_by_name: dict[str, list[tuple[str, int]]] = {}
+		for id_, attr, depth in attr_access:
+			attr_access_by_name.setdefault(id_, []).append((attr, depth))
+
+		for id_, items in attr_access_by_name.items():
+			if id_ in {"self", "msg"}:
+				continue
+			if id_ not in imports_by_name:
+				# print(f"{fpathRel}: {id_}.{attr}  (Unknown)")
+				continue
+			_module, module_fpath = imports_by_name[id_]
+			if module_fpath is None:
+				continue
+			module_parts = _module.split(".")
+			if len(module_parts) > 1 and id_ == module_parts[0]:
+				# unaliased dotted import: submodule-deref hops come first,
+				# the actual symbols are the deepest hops
+				max_depth = max(item[1] for item in items)
+				for attr, depth in items:
+					if depth == max_depth and attr != module_parts[-1]:
+						self.all_module_attr_access.add((attr, module_fpath))
+			else:
+				# plain or aliased import: keep all first-level attributes
+				min_depth = min(item[1] for item in items)
+				for attr, depth in items:
+					if depth == min_depth:
+						self.all_module_attr_access.add((attr, module_fpath))
+
+		# print(json.dumps(list(attr_access)))
+
+	def _scanFiles(self) -> None:
+		for dirPath, subDirs, files in os.walk(self.scan_dir):
+			dirPathRel = dirPath[len(self.root_dir) :]
+			for fname in files:
+				self.processFile(dirPathRel, fname, subDirs, files)
+
+	def _modulesToCheck(self) -> set[str]:
+		to_check_imported_modules = set()
+		for module_fpath in self.imported_from_by_module_path:
+			if module_fpath is None:
+				continue
+			to_check_imported_modules.add(module_fpath)
+
+		for _attr, module_fpath in self.all_module_attr_access:
+			if module_fpath is None:
+				continue
+			to_check_imported_modules.add(module_fpath)
+		return to_check_imported_modules
+
+	def _aggregateAttrAccess(self) -> dict[str, set[str]]:
+		module_attr_access_by_fpath: dict[str, set[str]] = {}
+		for attr, module_fpath in self.all_module_attr_access:
+			if module_fpath is None:
+				continue
+			try:
+				attrs = module_attr_access_by_fpath[module_fpath]
+			except KeyError:
+				attrs = module_attr_access_by_fpath[module_fpath] = set()
+			attrs.add(attr)
+		return module_attr_access_by_fpath
+
+	@staticmethod
+	def _lineOffsets(text: str) -> list[int]:
+		line_offsets = []
+		offset = 0
+		for line in text.splitlines(keepends=True):
+			line_offsets.append(offset)
+			offset += len(line)
+		return line_offsets
+
+	def _replaceAllValue(
+		self, text: str, all_stm: ast.Assign, new_all: list[str]
+	) -> str:
+		value = all_stm.value
 		assert value.lineno is not None
 		assert value.col_offset is not None
 		assert value.end_lineno is not None
 		assert value.end_col_offset is not None
-		start = _line_offsets[value.lineno - 1] + value.col_offset
-		end = _line_offsets[value.end_lineno - 1] + value.end_col_offset
-		new_text = text[:start] + formatList(sorted(_all_set)) + text[end:]
-		with open(full_path, "w", encoding="utf-8") as file:
-			file.write(new_text)
-		modifiedFiles.add(module_fpath)
-	elif has_all:
-		print(module_fpath)
-		print("ADD to __all__:", formatList(add_list))
-		print()
-	elif modifyAndOpenFiles:
+		line_offsets = self._lineOffsets(text)
+		start = line_offsets[value.lineno - 1] + value.col_offset
+		end = line_offsets[value.end_lineno - 1] + value.end_col_offset
+		return text[:start] + formatList(new_all) + text[end:]
+
+	def _insertAll(self, text: str, code: ast.Module, new_all: list[str]) -> str:
 		insert_at = 0
 		first = code.body[0] if code.body else None
 		if (
@@ -542,22 +384,127 @@ for module_fpath in sorted(to_check_imported_modules):
 			and isinstance(first.value.value, str)
 		):
 			assert first.end_lineno is not None
-			insert_at = _line_offsets[first.end_lineno - 1] + len(
-				_lines[first.end_lineno - 1]
+			line_offsets = self._lineOffsets(text)
+			lines = text.splitlines(keepends=True)
+			insert_at = line_offsets[first.end_lineno - 1] + len(
+				lines[first.end_lineno - 1]
 			)
-		new_text = (
-			text[:insert_at] + f"__all__ = {formatList(add_list)}\n" + text[insert_at:]
+		return (
+			text[:insert_at] + f"__all__ = {formatList(new_all)}\n" + text[insert_at:]
 		)
+
+	def _writeFile(self, full_path: str, module_fpath: str, new_text: str) -> None:
 		with open(full_path, "w", encoding="utf-8") as file:
 			file.write(new_text)
-		modifiedFiles.add(module_fpath)
-	else:
-		print(module_fpath)
-		print("__all__ =", formatList(add_list))
-		print()
+		self.modified_files.add(module_fpath)
+
+	def _processModule(
+		self,
+		module_fpath: str,
+		module_attr_access_by_fpath: dict[str, set[str]],
+	) -> None:
+		# print(module, module_fpath)
+		full_path = join(self.root_dir, module_fpath)
+		with open(full_path, encoding="utf-8") as file_:
+			text = file_.read()
+		if self.is_excluded(module_fpath):
+			return
+		module_top = module_fpath.split("/", maxsplit=1)[0]
+		if module_top in self.exclude_toplevel_module:
+			return
+		try:
+			code = ast.parse(text)
+		except Exception as e:
+			print(f"failed to parse {module_fpath=}: {e}", file=sys.stderr)
+			return
+		all_stm, all_list = find__all__(code)
+		has_all = False
+		all_set = set()
+		all_set_current = set()
+		if all_list is not None:
+			has_all = True
+			all_set = set(all_list)
+			all_set_current = all_set.copy()
+		names1 = self.imported_from_by_module_path.get(module_fpath)
+		if names1:
+			slash_dunder_init = os.sep + "__init__.py"
+			for name in names1:
+				if module_fpath.endswith(slash_dunder_init):
+					module_dir_name = join(dirname(module_fpath), name)
+					if isfile(module_dir_name + ".py") or isdir(module_dir_name):
+						continue
+				all_set.add(name)
+		names2 = module_attr_access_by_fpath.get(module_fpath)
+		if names2:
+			all_set.update(names2)
+		all_set.discard("*")
+		all_set_current.discard("*")
+		if not all_set:
+			return
+
+		if has_all:
+			used_set = set(names1 or []) | set(names2 or [])
+			unused_set = all_set_current.difference(used_set)
+			# print(f"{module_fpath}: used {sorted(used_set)}")
+			for symbol in sorted(unused_set):
+				if symbol.startswith("__") and symbol.endswith("__"):
+					continue
+				print(f"{module_fpath}: unused symbol {symbol} in __all__")
+
+		add_list = sorted(all_set.difference(all_set_current))
+		if not add_list:
+			return
+
+		if has_all and self.modify_and_open_files:
+			assert all_stm is not None
+			new_text = self._replaceAllValue(text, all_stm, sorted(all_set))
+			self._writeFile(full_path, module_fpath, new_text)
+		elif has_all:
+			print(module_fpath)
+			print("ADD to __all__:", formatList(add_list))
+			print()
+		elif self.modify_and_open_files:
+			new_text = self._insertAll(text, code, add_list)
+			self._writeFile(full_path, module_fpath, new_text)
+		else:
+			print(module_fpath)
+			print("__all__ =", formatList(add_list))
+			print()
+
+	def _checkModules(self) -> None:
+		module_attr_access_by_fpath = self._aggregateAttrAccess()
+		for module_fpath in sorted(self._modulesToCheck()):
+			self._processModule(module_fpath, module_attr_access_by_fpath)
+
+	def run(self) -> None:
+		self._scanFiles()
+		self._checkModules()
+		if self.modified_files:
+			cmd = [self.editor] + [join(self.root_dir, p) for p in self.modified_files]
+			print(cmd)
+			subprocess.call(cmd)
 
 
-if modifiedFiles:
-	cmd = [editor] + [join(rootDir, p) for p in modifiedFiles]
-	print(cmd)
-	subprocess.call(cmd)
+def main() -> None:
+	parser = argparse.ArgumentParser(
+		prog=sys.argv[0],
+		add_help=False,
+		# allow_abbrev=False,
+	)
+	parser.add_argument(
+		"--no-modify",
+		action="store_true",
+		help="do not modify files, only print",
+	)
+	parser.add_argument(
+		"scan_dir",
+		action="store",
+		default=".",
+		nargs="?",
+	)
+	args = parser.parse_args()
+	ImportAnalyzer(args.scan_dir, not args.no_modify).run()
+
+
+if __name__ == "__main__":
+	main()
