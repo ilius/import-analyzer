@@ -9,7 +9,7 @@ import subprocess
 import sys
 import warnings
 from collections.abc import Callable, Iterable, Sequence
-from functools import lru_cache
+from functools import cmp_to_key, lru_cache
 from os.path import dirname, isdir, isfile, join, realpath, split
 
 import tomllib
@@ -73,6 +73,121 @@ def formatList(lst: list[str]) -> str:
 	return json.dumps(lst)
 
 
+_ASCII_DIGITS = "0123456789"
+
+
+def _digit_value(c: str | None) -> int | None:
+	if c is not None and c in _ASCII_DIGITS:
+		return ord(c) - 48
+	return None
+
+
+def _natord_compare(a: str, b: str) -> int:
+	"""
+	Natural-order string comparison, mirroring the `natord` crate used by ruff.
+
+	Skips whitespace, compares runs of ASCII digits by numeric value, and
+	falls back to code-point comparison for other characters.
+	"""
+	la = iter(a)
+	ra = iter(b)
+	lch = next(la, None)
+	rch = next(ra, None)
+	ld = _digit_value(lch)
+	rd = _digit_value(rch)
+
+	def read_left() -> None:
+		nonlocal lch, ld
+		lch = next(la, None)
+		ld = _digit_value(lch)
+
+	def read_right() -> None:
+		nonlocal rch, rd
+		rch = next(ra, None)
+		rd = _digit_value(rch)
+
+	while True:
+		while lch is not None and lch.isspace():
+			read_left()
+		while rch is not None and rch.isspace():
+			read_right()
+		if lch is None and rch is None:
+			return 0
+		if lch is None:
+			return -1
+		if rch is None:
+			return 1
+		if ld is not None and rd is not None:
+			if ld == 0 or rd == 0:
+				if ld != rd:
+					return -1 if ld < rd else 1
+				while True:
+					read_left()
+					read_right()
+					if ld is not None and rd is not None:
+						if ld != rd:
+							return -1 if ld < rd else 1
+					elif ld is not None:
+						return 1
+					elif rd is not None:
+						return -1
+					else:
+						break
+			else:
+				lastcmp = 0 if ld == rd else (-1 if ld < rd else 1)
+				while True:
+					read_left()
+					read_right()
+					if ld is not None and rd is not None:
+						if lastcmp == 0 and ld != rd:
+							lastcmp = -1 if ld < rd else 1
+					elif ld is not None:
+						return 1
+					elif rd is not None:
+						return -1
+					else:
+						break
+				if lastcmp != 0:
+					return lastcmp
+			continue
+		if lch != rch:
+			return -1 if lch < rch else 1
+		read_left()
+		read_right()
+
+
+def _is_cased_uppercase(value: str) -> bool:
+	"""True if `value` has at least one uppercase char and no lowercase char."""
+	cased = False
+	for c in value:
+		if c.islower():
+			return False
+		if not cased and c.isupper():
+			cased = True
+	return cased
+
+
+def _all_member_category(value: str) -> int:
+	"""Ruff isort-style category: 0=Constant, 1=Class, 2=Other."""
+	if len(value) > 1 and _is_cased_uppercase(value):
+		return 0
+	if value[:1].isupper():
+		return 1
+	return 2
+
+
+def _sortAll(members: Iterable[str]) -> list[str]:
+	"""Sort `__all__` entries the way ruff's RUF022 fix does."""
+
+	def cmp(a: str, b: str) -> int:
+		category_cmp = _all_member_category(a) - _all_member_category(b)
+		if category_cmp:
+			return category_cmp
+		return _natord_compare(a, b)
+
+	return sorted(members, key=cmp_to_key(cmp))
+
+
 def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
 	for stm in code.body:
 		if not isinstance(stm, ast.Assign):
@@ -97,8 +212,9 @@ def find__all__(code: ast.Module) -> tuple[ast.Assign | None, list[str] | None]:
 
 
 class ImportAnalyzer:
-	def __init__(self, scan_dir: str, modify_and_open_files: bool) -> None:
-		self.modify_and_open_files = modify_and_open_files
+	def __init__(self, scan_dir: str, modify_files: bool, open_files: bool) -> None:
+		self.modify_files = modify_files
+		self.open_files = open_files
 		self.editor = os.getenv("IDE", "xdg-open")
 		self.modified_files: set[str] = set()
 		self.scan_dir = realpath(scan_dir)
@@ -126,6 +242,14 @@ class ImportAnalyzer:
 		config = (full_config.get("tool") or {}).get("import-analyzer") or {}
 		self.exclude_toplevel_module = set(config.get("exclude_toplevel_module", []))
 		re_exclude_list = [re.compile("^" + pat) for pat in config.get("exclude", [])]
+		ruff = (full_config.get("tool") or {}).get("ruff") or {}
+		ruff_format = ruff.get("format") or {}
+		self.line_length = int(ruff.get("line-length", 100))
+		self.indent_width = int(ruff.get("indent-width", 4))
+		indent_style = (
+			ruff_format.get("indent-style") or ruff.get("indent-style") or "space"
+		)
+		self.indent_unit = "\t" if indent_style == "tab" else " " * self.indent_width
 
 		@lru_cache(maxsize=None, typed=False)
 		def is_excluded(fpath: str) -> bool:
@@ -362,6 +486,18 @@ class ImportAnalyzer:
 			offset += len(line)
 		return line_offsets
 
+	def _formatAllValue(self, members: list[str], leading_indent: str) -> str:
+		inline = formatList(members)
+		line = f"__all__ = {inline}"
+		if (
+			len((leading_indent + line).expandtabs(self.indent_width))
+			<= self.line_length
+		):
+			return inline
+		item_indent = leading_indent + self.indent_unit
+		items = ",\n".join(f"{item_indent}{json.dumps(m)}" for m in members)
+		return f"[\n{items},\n{leading_indent}]"
+
 	def _replaceAllValue(
 		self, text: str, all_stm: ast.Assign, new_all: list[str]
 	) -> str:
@@ -373,25 +509,44 @@ class ImportAnalyzer:
 		line_offsets = self._lineOffsets(text)
 		start = line_offsets[value.lineno - 1] + value.col_offset
 		end = line_offsets[value.end_lineno - 1] + value.end_col_offset
-		return text[:start] + formatList(new_all) + text[end:]
+		assert all_stm.lineno is not None
+		assert all_stm.col_offset is not None
+		line_start = line_offsets[all_stm.lineno - 1]
+		leading_indent = text[line_start : line_start + all_stm.col_offset]
+		return text[:start] + self._formatAllValue(new_all, leading_indent) + text[end:]
 
 	def _insertAll(self, text: str, code: ast.Module, new_all: list[str]) -> str:
+		line_offsets = self._lineOffsets(text)
+		lines = text.splitlines(keepends=True)
+
+		def stmt_end(stm: ast.stmt) -> int:
+			assert stm.end_lineno is not None
+			return line_offsets[stm.end_lineno - 1] + len(lines[stm.end_lineno - 1])
+
 		insert_at = 0
-		first = code.body[0] if code.body else None
+		docstring = None
+		body = code.body
 		if (
-			isinstance(first, ast.Expr)
-			and isinstance(first.value, ast.Constant)
-			and isinstance(first.value.value, str)
+			body
+			and isinstance(body[0], ast.Expr)
+			and isinstance(body[0].value, ast.Constant)
+			and isinstance(body[0].value.value, str)
 		):
-			assert first.end_lineno is not None
-			line_offsets = self._lineOffsets(text)
-			lines = text.splitlines(keepends=True)
-			insert_at = line_offsets[first.end_lineno - 1] + len(
-				lines[first.end_lineno - 1]
-			)
-		return (
-			text[:insert_at] + f"__all__ = {formatList(new_all)}\n" + text[insert_at:]
-		)
+			docstring = body[0]
+			body = body[1:]
+		leading_import = None
+		for stm in body:
+			if isinstance(stm, ast.Import | ast.ImportFrom):
+				leading_import = stm
+				continue
+			break
+		if leading_import is not None:
+			insert_at = stmt_end(leading_import)
+		elif docstring is not None:
+			insert_at = stmt_end(docstring)
+		prefix = "\n" if insert_at else ""
+		all_value = self._formatAllValue(new_all, "")
+		return text[:insert_at] + f"{prefix}__all__ = {all_value}\n" + text[insert_at:]
 
 	def _writeFile(self, full_path: str, module_fpath: str, new_text: str) -> None:
 		with open(full_path, "w", encoding="utf-8") as file:
@@ -451,19 +606,19 @@ class ImportAnalyzer:
 					continue
 				print(f"{module_fpath}: unused symbol {symbol} in __all__")
 
-		add_list = sorted(all_set.difference(all_set_current))
+		add_list = _sortAll(all_set.difference(all_set_current))
 		if not add_list:
 			return
 
-		if has_all and self.modify_and_open_files:
+		if has_all and self.modify_files:
 			assert all_stm is not None
-			new_text = self._replaceAllValue(text, all_stm, sorted(all_set))
+			new_text = self._replaceAllValue(text, all_stm, _sortAll(all_set))
 			self._writeFile(full_path, module_fpath, new_text)
 		elif has_all:
 			print(module_fpath)
 			print("ADD to __all__:", formatList(add_list))
 			print()
-		elif self.modify_and_open_files:
+		elif self.modify_files:
 			new_text = self._insertAll(text, code, add_list)
 			self._writeFile(full_path, module_fpath, new_text)
 		else:
@@ -479,7 +634,7 @@ class ImportAnalyzer:
 	def run(self) -> None:
 		self._scanFiles()
 		self._checkModules()
-		if self.modified_files:
+		if self.modify_files and self.open_files and self.modified_files:
 			cmd = [self.editor] + [join(self.root_dir, p) for p in self.modified_files]
 			print(cmd)
 			subprocess.call(cmd)
@@ -497,13 +652,18 @@ def main() -> None:
 		help="do not modify files, only print",
 	)
 	parser.add_argument(
+		"--open",
+		action="store_true",
+		help="open modified files in editor after done",
+	)
+	parser.add_argument(
 		"scan_dir",
 		action="store",
 		default=".",
 		nargs="?",
 	)
 	args = parser.parse_args()
-	ImportAnalyzer(args.scan_dir, not args.no_modify).run()
+	ImportAnalyzer(args.scan_dir, not args.no_modify, args.open).run()
 
 
 if __name__ == "__main__":
